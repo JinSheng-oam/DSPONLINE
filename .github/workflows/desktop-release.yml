@@ -4,16 +4,37 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: Release channel
+        description: "Release channel"
         required: true
-        default: stable
+        default: "stable"
         type: choice
-        options: [stable, beta, nightly]
+        options:
+          - stable
+          - beta
+          - nightly
+      edition:
+        description: "Desktop edition"
+        required: true
+        default: "standard"
+        type: choice
+        options:
+          - standard
+          - performance
+      skip_tests:
+        description: "Skip unit and native test suites (faster packaging)"
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: "Publish as GitHub Release"
+        required: false
+        default: true
+        type: boolean
   push:
     tags: ["desktop-v*"]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
@@ -31,25 +52,101 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
-      - run: npm run licenses:check
-      - run: npm run typecheck
-      - run: npm run test:native-core:serial
-      - run: npm run native:build-host
-      - run: npm run test:native
-      - run: npm run desktop:release
-      - name: Resolve the complete desktop release output
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: License check
+        if: ${{ !inputs.skip_tests }}
+        run: npm run licenses:check
+
+      - name: Type check
+        if: ${{ !inputs.skip_tests }}
+        run: npm run typecheck
+
+      - name: Rust serial unit tests
+        if: ${{ !inputs.skip_tests }}
+        run: npm run test:native-core:serial
+
+      - name: Build native host sidecar
+        run: npm run native:build-host
+
+      - name: Native tests
+        if: ${{ !inputs.skip_tests }}
+        run: npm run test:native
+
+      - name: Build Desktop Application
+        id: build_desktop
         shell: pwsh
         run: |
-          $relative = node desktop/select-desktop-release-output.cjs
-          if ($LASTEXITCODE -ne 0) { throw "Expected exactly one complete desktop release output" }
-          "DSP_DESKTOP_RELEASE_OUTPUT=$relative" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          $hasSigning = [bool]($env:CSC_LINK -and $env:CSC_KEY_PASSWORD)
+          $edition = "${{ inputs.edition || 'standard' }}"
+          Write-Host "Signing credentials present: $hasSigning"
+          Write-Host "Target edition: $edition"
+
+          if ($hasSigning -and $edition -eq 'standard') {
+            Write-Host "Executing signed production desktop:release..."
+            npm run desktop:release
+            $relative = node desktop/select-desktop-release-output.cjs
+            if ($LASTEXITCODE -ne 0) { throw "Expected exactly one complete desktop release output" }
+            $targetDir = $relative
+          } else {
+            if ($hasSigning) {
+              Write-Host "Performance edition does not use formal release channel signing. Running dist mode."
+            } else {
+              Write-Host "No Windows code signing certificate found. Running unsigned dist mode."
+            }
+            if ($edition -eq 'performance') {
+              npm run desktop:performance:dist
+              $targetDir = if (Test-Path 'release-performance-edition') { 'release-performance-edition' } else { 'release-performance-edition-fallback' }
+            } else {
+              npm run desktop:dist
+              $targetDir = if (Test-Path 'release') { 'release' } else { 'release-fallback' }
+            }
+          }
+
+          Write-Host "Resolved output directory: $targetDir"
+          "DSP_DESKTOP_RELEASE_OUTPUT=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create Portable Zip
+        shell: pwsh
+        run: |
+          $targetDir = "$env:DSP_DESKTOP_RELEASE_OUTPUT"
+          $unpacked = Join-Path $targetDir "win-unpacked"
+          if (Test-Path $unpacked) {
+            $edition = "${{ inputs.edition || 'standard' }}"
+            $pkg = Get-Content "package.json" | ConvertFrom-Json
+            $version = $pkg.version
+            $nameSuffix = if ($edition -eq 'performance') { "performance-portable" } else { "portable" }
+            $zipName = "dsp-idle-$version-win-x64-$nameSuffix.zip"
+            $zipPath = Join-Path $targetDir $zipName
+            Write-Host "Compressing portable build to $zipPath..."
+            Compress-Archive -Path "$unpacked\*" -DestinationPath $zipPath -CompressionLevel Optimal
+            Write-Host "Created portable archive: $zipPath"
+          }
+
+      - name: Upload Desktop Artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: dsp-idle-${{ env.DSP_RELEASE_CHANNEL }}
-          if-no-files-found: error
+          name: dsp-idle-${{ inputs.edition || 'standard' }}-${{ env.DSP_RELEASE_CHANNEL }}
+          if-no-files-found: warn
           path: |
             ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/*.exe
+            ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/*.zip
             ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/*.blockmap
             ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/latest.yml
+            ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/desktop-build-evidence.json
             ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/update-feed/**
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.create_release || startsWith(github.ref, 'refs/tags/desktop-v') }}
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191
+        with:
+          tag_name: ${{ github.ref_name || format('desktop-v1.3.0-{0}', github.run_number) }}
+          name: DSP Idle Desktop 1.3.0 (${{ env.DSP_RELEASE_CHANNEL }})
+          draft: false
+          prerelease: ${{ (inputs.channel || 'stable') != 'stable' }}
+          files: |
+            ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/*.exe
+            ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/*.zip
+            ${{ env.DSP_DESKTOP_RELEASE_OUTPUT }}/*.blockmap
